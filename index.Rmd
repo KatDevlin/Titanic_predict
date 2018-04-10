@@ -1,0 +1,184 @@
+---
+title: "Predicting Survival on the Titanic"
+author: "Kat Devlin"
+date: "2018年4月10日"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This is my first attempt at predicting passengers' survival on the Titantic, and it also happens to be my first ever submission to Kaggle. 
+
+## Explore the Data
+
+
+```{r}
+
+setwd("~/Desktop/Titanic_predict")
+x <- read.csv("train.csv")
+head(x)
+
+# First I had to indulge my former middle school self who swooned over Leo & Kate Winslet in the movie version:
+grep("Jack", x$Name, value=T)  # not Jack
+grep("Dawson", x$Name, value=T)
+grep("Rose", x$Name, value=T)  # not Rose
+grep("Calvert", x$Name, value=T)
+```
+
+*Sigh*, it looks like Rose & Jack were not on board. Alright, time to do actual analysis.
+
+```{r}
+library(Amelia)
+missmap(x)  # age has missing values ...
+library(YaleToolkit) 
+whatis(x) # also shows missingness for age (177)
+
+# My gut says gender and age played large roles in who survived, a la "women and children first". Class probably did as well. So I'll make sex a dummy variable and plot away.
+x$Sex.n <- as.numeric(x$Sex)
+x$Sex.n[x$Sex.n==2] <- 0
+
+plot(x$Age, jitter(x$Pclass, 1), col= x$Survived+2)
+plot(jitter(x$Sex.n, 1), jitter(x$Pclass, 1), col= x$Survived+2) 
+# this is interesting
+
+# Now I'll make a few more variables that might be worth exploring.
+x$Age2 <- x$Age * x$Age
+x$SexClass <- x$Sex.n * x$Pclass
+x$alone <- as.numeric(x$SibSp==0 & x$Parch==0)
+```
+## Imputing with k-Nearest Neighbors
+
+I still think age will be an important factor, so I want to try to fill in some missing values. Here I will use k-nearest neighbors with the training data only, then construct my model based off of that.
+
+```{r}
+w <- x  # make a copy in case we need to do more work on the original
+whatis(w)
+z <- w[, c("Pclass", "Sex.n", "SibSp", "Parch", "Fare", "SexClass", "alone")]
+noage <- which(is.na(w$Age))
+noage[1:4] # we'll use these as a check later
+
+delta <- rep(NA, nrow(z))      # Not putting this as a column of z to avoid confusion. 
+
+top5q <-  5/length(delta)
+for (j in noage) { # iterating over indices of missing values
+  for (i in 1:nrow(z)) { 
+    delta[i] <- sum((z[j, ] - z[i, ])^2) # distance of i-th row to missing row
+  } 
+  delta[noage] <- 100000
+  s <- quantile(delta, top5q)
+  nbs <- delta <= s
+  w$Age[j] <- mean(w$Age[nbs])  
+}
+
+w$Age[6]
+w$Age[18]
+w$Age[20]
+w$Age[27]
+whatis(w) # success
+w$Age2 <- w$Age * w$Age  # add back in the square term
+```
+
+We have successfully imputed the age for all 177 missing cases. 
+
+## Logit Model for Predicting with Training Data
+
+After toying around for a little while, I landed on the following logit model. With our binary dependent variable (survived or not) this made the most sense to me.
+
+```{r}
+glm.train3w <- glm(Survived ~ Age + Age2 + Pclass + Sex.n + SibSp + SexClass + alone, 
+                   family=binomial(link = "logit"), data=w)
+summary(glm.train3w)
+
+# then I do a general diagnostic 
+library(pscl)
+pR2(glm.train3w) # solid McFadden score in the .2-.4 range
+```
+
+## Quick Test of Prediction Accuracy
+
+Now that I feel good about my model, I want to do a quick test within the training dataset to see how good my predictions are given a known outcome. So I split the training data into train/test sets. (Yes this is becoming Inception with training data.)
+
+``` {r}
+# test with k-nearest neighbors imputation
+test0 <- w[1:400,]
+train0 <- w[401:891,]
+
+glm.train0 <- glm(Survived ~ Age + Age2 + Pclass + Sex.n + SibSp + SexClass + alone, 
+                  family=binomial(link = "logit"), data=train0)
+summary(glm.train0)
+
+fitted.results <- predict(glm.train0, newdata=subset(test0,select=c(2,3,6,7,8,13,14,15,16)), type='response')
+fitted.results <- ifelse(fitted.results > 0.5,1,0)
+
+misClasificError <- mean(fitted.results != test0$Survived)
+print(paste('Accuracy',1-misClasificError))
+# 78% correct classification
+```
+
+## Get Final Survival Predictions
+
+That model seems to work fairly well, so now I want to bring in the Kaggle test data and get the actual predictions for contest submission.
+
+``` {r}
+y <- read.csv("test.csv")
+whatis(y) # 86 missing Age, 1 missing Fare (not used in my model) 
+
+# variable tinkering again
+y$Sex.n <- as.numeric(y$Sex)
+y$Sex.n[y$Sex.n==2] <- 0
+y$Age2 <- y$Age * y$Age
+y$SexClass <- y$Sex.n * y$Pclass
+y$alone <- as.numeric(y$SibSp==0 & y$Parch==0)
+```
+
+This time, I am going to impute the missing age values using both original data sets after binding them together.
+```{r}
+k1 <- x[, c("PassengerId", "Pclass", "Age", "Sex.n", "SibSp", "Parch", "Fare", "SexClass", "alone")]
+k2 <- y[, c("PassengerId", "Pclass", "Age", "Sex.n", "SibSp", "Parch", "Fare", "SexClass", "alone")]
+k <- rbind(k1, k2)  # This is all the observations with 263 missing Age
+whatis(k)
+
+# There is a missing value for Fare now, too. Let's find it and change that.
+which(is.na(k$Fare))  # row 1044
+k[1044,]  # older male in 3rd class. 
+median(k$Fare[k$Pclass==3], na.rm=T)
+# We'll let his ticket cost $8.05.
+k$Fare[c(1044)] <- 8.05
+whatis(k) # no more missing fares.
+
+# Back to imputing. 
+u <- k[, c("Pclass", "Sex.n", "SibSp", "Parch", "Fare", "SexClass", "alone")]
+noage <- which(is.na(k$Age))
+noage[1:4] # to check on later
+
+delta <- rep(NA, nrow(u))      # Not putting this as a column of z to avoid confusion. 
+
+top5q <-  5/length(delta)
+# Warning: This step takes a while!
+for (j in noage) { # iterating over indices of missing values
+  for (i in 1:nrow(u)) { 
+    delta[i] <- sum((u[j, ] - u[i, ])^2) # distance of i-th row to missing row
+  } 
+  delta[noage] <- 100000
+  s <- quantile(delta, top5q)
+  nbs <- delta <= s
+  k$Age[j] <- mean(k$Age[nbs])  
+}
+whatis(k)  # no more missingness in Age
+
+k2$Age <- k$Age[892:1309]
+k2$Age2 <- k2$Age * k2$Age
+
+fitted.results <- predict(glm.train3w, newdata=k2, type='response')
+fitted.results <- ifelse(fitted.results > 0.5,1,0)
+k2$Survived <- fitted.results  # adds the Survived predictions
+
+a <- k2[c(1,9)]
+#write.csv(a, file="prediction1.csv", row.names = F)
+
+###-----End of Script-----###
